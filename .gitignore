@@ -44,3 +44,5 @@ Thumbs.db
 # Temporal
 temporal-data/
 
+# Custom
+.history
