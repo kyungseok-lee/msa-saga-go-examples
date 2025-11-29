@@ -428,6 +428,25 @@ docker compose logs -f order-service
 docker compose logs order-service | grep ERROR
 ```
 
+### 데이터베이스 및 볼륨 확인
+
+```bash
+# Docker 볼륨 정보 확인
+make check-volumes
+
+# Order DB 데이터 확인
+make check-db-order
+
+# Payment DB 데이터 확인
+make check-db-payment
+
+# Inventory DB 데이터 확인
+make check-db-inventory
+
+# Redis 키 확인
+make check-redis
+```
+
 ## 🧪 테스트
 
 ### 단위 테스트

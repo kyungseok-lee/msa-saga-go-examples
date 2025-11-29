@@ -112,3 +112,6 @@ health: ## 모든 서비스 헬스 체크
 	@curl -s http://localhost:8003/health && echo " ✅ Inventory Service"
 	@curl -s http://localhost:8004/health && echo " ✅ Delivery Service"
 
+check-volumes: ## Docker 볼륨 확인
+	@./scripts/check-volumes.sh
+
