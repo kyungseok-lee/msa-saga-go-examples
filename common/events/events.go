@@ -27,6 +27,13 @@ const (
 	EventDeliveryFailed  EventType = "delivery.failed.v1"
 )
 
+// Event 이벤트 인터페이스
+type Event interface {
+	GetEventType() EventType
+	GetEventID() string
+	GetCorrelationID() string
+}
+
 // BaseEvent 모든 이벤트의 기본 구조
 type BaseEvent struct {
 	EventID       string    `json:"eventId"`
@@ -34,6 +41,21 @@ type BaseEvent struct {
 	SchemaVersion int       `json:"schemaVersion"`
 	OccurredAt    time.Time `json:"occurredAt"`
 	CorrelationID string    `json:"correlationId"` // SAGA ID로 사용
+}
+
+// GetEventType 이벤트 타입 반환
+func (e BaseEvent) GetEventType() EventType {
+	return e.EventType
+}
+
+// GetEventID 이벤트 ID 반환
+func (e BaseEvent) GetEventID() string {
+	return e.EventID
+}
+
+// GetCorrelationID 상관관계 ID 반환
+func (e BaseEvent) GetCorrelationID() string {
+	return e.CorrelationID
 }
 
 // OrderCreatedEvent 주문 생성 이벤트

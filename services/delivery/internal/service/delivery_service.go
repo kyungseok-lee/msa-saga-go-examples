@@ -2,14 +2,14 @@ package service
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/kyungseok/msa-saga-go-examples/common/errors"
 	"github.com/kyungseok/msa-saga-go-examples/common/events"
+	"github.com/kyungseok/msa-saga-go-examples/services/delivery/internal/domain"
+	"github.com/kyungseok/msa-saga-go-examples/services/delivery/internal/repository"
 	"go.uber.org/zap"
 )
 
@@ -19,15 +19,21 @@ type DeliveryService interface {
 }
 
 type deliveryService struct {
-	db     *sql.DB
-	logger *zap.Logger
+	deliveryRepo repository.DeliveryRepository
+	outboxRepo   repository.OutboxRepository
+	logger       *zap.Logger
 }
 
 // NewDeliveryService 배송 서비스 생성
-func NewDeliveryService(db *sql.DB, logger *zap.Logger) DeliveryService {
+func NewDeliveryService(
+	deliveryRepo repository.DeliveryRepository,
+	outboxRepo repository.OutboxRepository,
+	logger *zap.Logger,
+) DeliveryService {
 	return &deliveryService{
-		db:     db,
-		logger: logger,
+		deliveryRepo: deliveryRepo,
+		outboxRepo:   outboxRepo,
+		logger:       logger,
 	}
 }
 
@@ -40,36 +46,35 @@ func (s *deliveryService) HandleStockReserved(ctx context.Context, evt events.St
 	idempotencyKey := fmt.Sprintf("delivery-%d-%s", evt.OrderID, evt.EventID)
 
 	// 이미 처리된 요청인지 확인
-	var existingDeliveryID int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id FROM deliveries WHERE idempotency_key = $1
-	`, idempotencyKey).Scan(&existingDeliveryID)
-
-	if err == nil {
-		s.logger.Info("delivery already started", zap.String("idempotencyKey", idempotencyKey))
+	existingDelivery, err := s.deliveryRepo.FindByIdempotencyKey(ctx, idempotencyKey)
+	if err == nil && existingDelivery != nil {
+		s.logger.Info("delivery already started",
+			zap.String("idempotencyKey", idempotencyKey),
+			zap.Int64("deliveryId", existingDelivery.ID))
 		return nil
 	}
 
+	// NotFound 에러가 아니면 실패
+	if err != nil && !errors.IsCode(err, errors.ErrCodeNotFound) {
+		return err
+	}
+
 	// 트랜잭션 시작
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.deliveryRepo.BeginTx(ctx)
 	if err != nil {
-		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to begin transaction", err)
+		return err
 	}
 	defer tx.Rollback()
 
 	// 배송 정보 생성
-	var deliveryID int64
 	trackingNumber := fmt.Sprintf("TRK-%d-%d", evt.OrderID, time.Now().Unix())
 	address := "서울시 강남구 테헤란로 123" // 실제로는 주문 정보에서 가져와야 함
+	carrier := "CJ대한통운"
 
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO deliveries (order_id, address, status, idempotency_key, tracking_number, carrier, created_at, updated_at)
-		VALUES ($1, $2, 'PREPARING', $3, $4, 'CJ대한통운', NOW(), NOW())
-		RETURNING id
-	`, evt.OrderID, address, idempotencyKey, trackingNumber).Scan(&deliveryID)
+	delivery := domain.NewDelivery(evt.OrderID, address, trackingNumber, carrier, idempotencyKey)
 
-	if err != nil {
-		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to create delivery", err)
+	if err := s.deliveryRepo.Create(ctx, tx, delivery); err != nil {
+		return err
 	}
 
 	// DeliveryStarted 이벤트 발행
@@ -83,19 +88,12 @@ func (s *deliveryService) HandleStockReserved(ctx context.Context, evt events.St
 			CorrelationID: evt.CorrelationID,
 		},
 		OrderID:    evt.OrderID,
-		DeliveryID: deliveryID,
+		DeliveryID: delivery.ID,
 		Address:    address,
 	}
 
-	payload, _ := json.Marshal(deliveryStartedEvt)
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload, status, created_at)
-		VALUES ('delivery', $1, $2, $3, 'PENDING', NOW())
-	`, deliveryID, string(events.EventDeliveryStarted), payload)
-
-	if err != nil {
-		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to insert outbox event", err)
+	if err := s.outboxRepo.InsertEvent(ctx, tx, "delivery", delivery.ID, deliveryStartedEvt); err != nil {
+		return err
 	}
 
 	// 트랜잭션 커밋
@@ -104,7 +102,7 @@ func (s *deliveryService) HandleStockReserved(ctx context.Context, evt events.St
 	}
 
 	s.logger.Info("delivery started successfully",
-		zap.Int64("deliveryId", deliveryID),
+		zap.Int64("deliveryId", delivery.ID),
 		zap.Int64("orderId", evt.OrderID),
 		zap.String("trackingNumber", trackingNumber))
 

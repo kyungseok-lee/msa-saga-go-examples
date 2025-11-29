@@ -3,13 +3,14 @@ package service
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/kyungseok/msa-saga-go-examples/common/errors"
 	"github.com/kyungseok/msa-saga-go-examples/common/events"
+	"github.com/kyungseok/msa-saga-go-examples/services/inventory/internal/domain"
+	"github.com/kyungseok/msa-saga-go-examples/services/inventory/internal/repository"
 	"go.uber.org/zap"
 )
 
@@ -20,15 +21,24 @@ type InventoryService interface {
 }
 
 type inventoryService struct {
-	db     *sql.DB
-	logger *zap.Logger
+	inventoryRepo    repository.InventoryRepository
+	reservationRepo  repository.StockReservationRepository
+	outboxRepo       repository.OutboxRepository
+	logger           *zap.Logger
 }
 
 // NewInventoryService 재고 서비스 생성
-func NewInventoryService(db *sql.DB, logger *zap.Logger) InventoryService {
+func NewInventoryService(
+	inventoryRepo repository.InventoryRepository,
+	reservationRepo repository.StockReservationRepository,
+	outboxRepo repository.OutboxRepository,
+	logger *zap.Logger,
+) InventoryService {
 	return &inventoryService{
-		db:     db,
-		logger: logger,
+		inventoryRepo:   inventoryRepo,
+		reservationRepo: reservationRepo,
+		outboxRepo:      outboxRepo,
+		logger:          logger,
 	}
 }
 
@@ -41,20 +51,23 @@ func (s *inventoryService) HandlePaymentCompleted(ctx context.Context, evt event
 	idempotencyKey := fmt.Sprintf("stock-reservation-%d-%s", evt.OrderID, evt.EventID)
 
 	// 이미 처리된 요청인지 확인
-	var existingReservationID int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id FROM stock_reservations WHERE idempotency_key = $1
-	`, idempotencyKey).Scan(&existingReservationID)
-
-	if err == nil {
-		s.logger.Info("stock already reserved", zap.String("idempotencyKey", idempotencyKey))
+	existingReservation, err := s.reservationRepo.FindByIdempotencyKey(ctx, idempotencyKey)
+	if err == nil && existingReservation != nil {
+		s.logger.Info("stock already reserved",
+			zap.String("idempotencyKey", idempotencyKey),
+			zap.Int64("reservationId", existingReservation.ID))
 		return nil
 	}
 
+	// NotFound 에러가 아니면 실패
+	if err != nil && !errors.IsCode(err, errors.ErrCodeNotFound) {
+		return err
+	}
+
 	// 트랜잭션 시작
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.inventoryRepo.BeginTx(ctx)
 	if err != nil {
-		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to begin transaction", err)
+		return err
 	}
 	defer tx.Rollback()
 
@@ -62,49 +75,33 @@ func (s *inventoryService) HandlePaymentCompleted(ctx context.Context, evt event
 	productID := int64(1)
 	quantity := 1 // evt.Quantity 사용 가능
 
-	var availableQty int
-	var version int64
-	err = tx.QueryRowContext(ctx, `
-		SELECT available_quantity, version FROM inventory WHERE product_id = $1 FOR UPDATE
-	`, productID).Scan(&availableQty, &version)
-
+	// 재고 조회 (FOR UPDATE)
+	inventory, err := s.inventoryRepo.FindByProductIDForUpdate(ctx, tx, productID)
 	if err != nil {
 		return s.publishStockReservationFailed(ctx, tx, evt, "product not found")
 	}
 
-	if availableQty < quantity {
+	// 재고 부족 체크
+	if !inventory.CanReserve(quantity) {
 		return s.publishStockReservationFailed(ctx, tx, evt, "insufficient stock")
 	}
 
-	// 재고 차감 (Optimistic Lock)
-	result, err := tx.ExecContext(ctx, `
-		UPDATE inventory
-		SET available_quantity = available_quantity - $1,
-			reserved_quantity = reserved_quantity + $1,
-			version = version + 1,
-			updated_at = NOW()
-		WHERE product_id = $2 AND version = $3
-	`, quantity, productID, version)
+	// 재고 예약 (Optimistic Lock)
+	oldVersion := inventory.Version
+	inventory.Reserve(quantity)
 
+	err = s.inventoryRepo.UpdateWithOptimisticLock(ctx, tx, inventory, oldVersion)
 	if err != nil {
-		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to update inventory", err)
-	}
-
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		return s.publishStockReservationFailed(ctx, tx, evt, "version conflict")
+		if errors.IsCode(err, errors.ErrCodeConflict) {
+			return s.publishStockReservationFailed(ctx, tx, evt, "version conflict")
+		}
+		return err
 	}
 
 	// 재고 예약 기록 생성
-	var reservationID int64
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO stock_reservations (order_id, product_id, quantity, status, idempotency_key, expired_at, created_at, updated_at)
-		VALUES ($1, $2, $3, 'RESERVED', $4, NOW() + INTERVAL '30 minutes', NOW(), NOW())
-		RETURNING id
-	`, evt.OrderID, productID, quantity, idempotencyKey).Scan(&reservationID)
-
-	if err != nil {
-		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to create reservation", err)
+	reservation := domain.NewStockReservation(evt.OrderID, productID, quantity, idempotencyKey)
+	if err := s.reservationRepo.Create(ctx, tx, reservation); err != nil {
+		return err
 	}
 
 	// StockReserved 이벤트 발행
@@ -118,19 +115,12 @@ func (s *inventoryService) HandlePaymentCompleted(ctx context.Context, evt event
 			CorrelationID: evt.CorrelationID,
 		},
 		OrderID:       evt.OrderID,
-		ReservationID: reservationID,
+		ReservationID: reservation.ID,
 		Quantity:      quantity,
 	}
 
-	payload, _ := json.Marshal(stockReservedEvt)
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload, status, created_at)
-		VALUES ('stock_reservation', $1, $2, $3, 'PENDING', NOW())
-	`, reservationID, string(events.EventStockReserved), payload)
-
-	if err != nil {
-		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to insert outbox event", err)
+	if err := s.outboxRepo.InsertEvent(ctx, tx, "stock_reservation", reservation.ID, stockReservedEvt); err != nil {
+		return err
 	}
 
 	// 트랜잭션 커밋
@@ -139,7 +129,7 @@ func (s *inventoryService) HandlePaymentCompleted(ctx context.Context, evt event
 	}
 
 	s.logger.Info("stock reserved successfully",
-		zap.Int64("reservationId", reservationID),
+		zap.Int64("reservationId", reservation.ID),
 		zap.Int64("orderId", evt.OrderID))
 
 	return nil
@@ -151,48 +141,40 @@ func (s *inventoryService) HandlePaymentRefunded(ctx context.Context, evt events
 		zap.Int64("orderId", evt.OrderID))
 
 	// 해당 주문의 재고 예약 조회
-	var reservationID int64
-	var productID int64
-	var quantity int
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, product_id, quantity FROM stock_reservations
-		WHERE order_id = $1 AND status = 'RESERVED'
-	`, evt.OrderID).Scan(&reservationID, &productID, &quantity)
-
+	reservation, err := s.reservationRepo.FindByOrderIDAndStatus(ctx, evt.OrderID, domain.ReservationStatusReserved)
 	if err != nil {
-		s.logger.Error("stock reservation not found", zap.Int64("orderId", evt.OrderID))
-		return nil // 이미 복구되었거나 예약이 없음
+		if errors.IsCode(err, errors.ErrCodeNotFound) {
+			s.logger.Warn("stock reservation not found - may already be restored",
+				zap.Int64("orderId", evt.OrderID))
+			return nil
+		}
+		return err
 	}
 
 	// 트랜잭션 시작
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.inventoryRepo.BeginTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// 재고 복구
-	_, err = tx.ExecContext(ctx, `
-		UPDATE inventory
-		SET available_quantity = available_quantity + $1,
-			reserved_quantity = reserved_quantity - $1,
-			version = version + 1,
-			updated_at = NOW()
-		WHERE product_id = $2
-	`, quantity, productID)
-
+	// 재고 조회 (FOR UPDATE)
+	inventory, err := s.inventoryRepo.FindByProductIDForUpdate(ctx, tx, reservation.ProductID)
 	if err != nil {
 		return err
 	}
 
-	// 예약 상태 업데이트
-	_, err = tx.ExecContext(ctx, `
-		UPDATE stock_reservations
-		SET status = 'CANCELED', updated_at = NOW()
-		WHERE id = $1
-	`, reservationID)
+	// 재고 복구
+	oldVersion := inventory.Version
+	inventory.Restore(reservation.Quantity)
 
-	if err != nil {
+	if err := s.inventoryRepo.UpdateWithOptimisticLock(ctx, tx, inventory, oldVersion); err != nil {
+		return err
+	}
+
+	// 예약 상태 업데이트
+	reservation.Cancel()
+	if err := s.reservationRepo.Update(ctx, tx, reservation); err != nil {
 		return err
 	}
 
@@ -207,27 +189,20 @@ func (s *inventoryService) HandlePaymentRefunded(ctx context.Context, evt events
 			CorrelationID: evt.CorrelationID,
 		},
 		OrderID:       evt.OrderID,
-		ReservationID: reservationID,
-		Quantity:      quantity,
+		ReservationID: reservation.ID,
+		Quantity:      reservation.Quantity,
 	}
 
-	payload, _ := json.Marshal(stockRestoredEvt)
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload, status, created_at)
-		VALUES ('stock_reservation', $1, $2, $3, 'PENDING', NOW())
-	`, reservationID, string(events.EventStockRestored), payload)
-
-	if err != nil {
+	if err := s.outboxRepo.InsertEvent(ctx, tx, "stock_reservation", reservation.ID, stockRestoredEvt); err != nil {
 		return err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return err
+		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to commit transaction", err)
 	}
 
 	s.logger.Info("stock restored successfully",
-		zap.Int64("reservationId", reservationID),
+		zap.Int64("reservationId", reservation.ID),
 		zap.Int64("orderId", evt.OrderID))
 
 	return nil
@@ -253,19 +228,12 @@ func (s *inventoryService) publishStockReservationFailed(
 		Reason:   reason,
 	}
 
-	payload, _ := json.Marshal(failedEvt)
-
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload, status, created_at)
-		VALUES ('order', $1, $2, $3, 'PENDING', NOW())
-	`, evt.OrderID, string(events.EventStockReservationFailed), payload)
-
-	if err != nil {
+	if err := s.outboxRepo.InsertEvent(ctx, tx, "order", evt.OrderID, failedEvt); err != nil {
 		return err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return err
+		return errors.Wrap(errors.ErrCodeDatabaseError, "failed to commit transaction", err)
 	}
 
 	s.logger.Warn("stock reservation failed event published",

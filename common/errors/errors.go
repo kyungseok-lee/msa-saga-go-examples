@@ -13,12 +13,15 @@ const (
 	ErrCodeInvalidOrder        ErrorCode = "INVALID_ORDER"
 	ErrCodeOrderNotFound       ErrorCode = "ORDER_NOT_FOUND"
 	ErrCodeDuplicateRequest    ErrorCode = "DUPLICATE_REQUEST"
+	ErrCodeNotFound            ErrorCode = "NOT_FOUND"
+	ErrCodeConflict            ErrorCode = "CONFLICT"
 
 	// Technical Errors
 	ErrCodeDatabaseError      ErrorCode = "DATABASE_ERROR"
 	ErrCodeNetworkError       ErrorCode = "NETWORK_ERROR"
 	ErrCodeTimeoutError       ErrorCode = "TIMEOUT_ERROR"
 	ErrCodeSerializationError ErrorCode = "SERIALIZATION_ERROR"
+	ErrCodeInternalError      ErrorCode = "INTERNAL_ERROR"
 	ErrCodeUnknownError       ErrorCode = "UNKNOWN_ERROR"
 )
 
@@ -73,9 +76,18 @@ func IsBusinessError(err error) bool {
 	if domainErr, ok := err.(*DomainError); ok {
 		switch domainErr.Code {
 		case ErrCodePaymentDeclined, ErrCodeOutOfStock, ErrCodeInsufficientBalance,
-			ErrCodeInvalidOrder, ErrCodeOrderNotFound, ErrCodeDuplicateRequest:
+			ErrCodeInvalidOrder, ErrCodeOrderNotFound, ErrCodeDuplicateRequest,
+			ErrCodeNotFound, ErrCodeConflict:
 			return true
 		}
+	}
+	return false
+}
+
+// IsCode 특정 에러 코드인지 확인
+func IsCode(err error, code ErrorCode) bool {
+	if domainErr, ok := err.(*DomainError); ok {
+		return domainErr.Code == code
 	}
 	return false
 }

@@ -19,7 +19,9 @@ import (
 	"github.com/kyungseok/msa-saga-go-examples/common/idempotency"
 	"github.com/kyungseok/msa-saga-go-examples/common/logger"
 	"github.com/kyungseok/msa-saga-go-examples/common/messaging"
+	"github.com/kyungseok/msa-saga-go-examples/services/inventory/internal/repository"
 	"github.com/kyungseok/msa-saga-go-examples/services/inventory/internal/service"
+	"github.com/kyungseok/msa-saga-go-examples/services/inventory/internal/worker"
 )
 
 func main() {
@@ -52,7 +54,13 @@ func main() {
 	}
 	defer publisher.Close()
 
-	inventoryService := service.NewInventoryService(db, log)
+	// Repository 생성
+	inventoryRepo := repository.NewInventoryRepository(db)
+	reservationRepo := repository.NewStockReservationRepository(db)
+	outboxRepo := repository.NewOutboxRepository(db)
+
+	// Service 생성
+	inventoryService := service.NewInventoryService(inventoryRepo, reservationRepo, outboxRepo, log)
 	idemStore := idempotency.NewRedisStore(redisClient, "inventory-service")
 
 	consumer, err := messaging.NewKafkaConsumer(config.KafkaBrokers, "inventory-service-group", log)
@@ -106,7 +114,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go startOutboxWorker(ctx, db, publisher, log)
+	outboxWorker := worker.NewOutboxWorker(outboxRepo, publisher, log, 1*time.Second)
+	go outboxWorker.Start(ctx)
 
 	// HTTP Server
 	mux := http.NewServeMux()
@@ -138,43 +147,6 @@ func main() {
 
 	cancel()
 	log.Info("server stopped")
-}
-
-func startOutboxWorker(ctx context.Context, db *sql.DB, publisher messaging.Publisher, logger *zap.Logger) {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			rows, err := db.QueryContext(ctx, `
-				SELECT id, event_type, payload FROM outbox_events
-				WHERE status = 'PENDING' ORDER BY created_at LIMIT 100
-			`)
-			if err != nil {
-				continue
-			}
-
-			for rows.Next() {
-				var id int64
-				var eventType string
-				var payload []byte
-				if err := rows.Scan(&id, &eventType, &payload); err != nil {
-					continue
-				}
-
-				if err := publisher.Publish(ctx, eventType, "", json.RawMessage(payload)); err != nil {
-					logger.Error("failed to publish", zap.Error(err))
-					continue
-				}
-
-				db.ExecContext(ctx, `UPDATE outbox_events SET status = 'SENT', sent_at = NOW() WHERE id = $1`, id)
-			}
-			rows.Close()
-		}
-	}
 }
 
 type Config struct {
